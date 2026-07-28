@@ -1,0 +1,11 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+data/
+tts_audio/
+__pycache__/
+*.pyc
+.venv/
+README.md

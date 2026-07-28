@@ -1,0 +1,11 @@
+# Automatically merged with docker-compose.yml by `docker compose up` when
+# both files sit in the same directory — no -f flag needed. Lets you build
+# and iterate on the image locally instead of pulling from GHCR.
+#
+# On your deploy server, either delete this file or run
+# `docker compose -f docker-compose.yml up -d` to skip it and use the
+# published image instead.
+services:
+  bot:
+    build: .
+    image: discord-tts-bot:dev

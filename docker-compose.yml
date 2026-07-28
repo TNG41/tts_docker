@@ -1,0 +1,17 @@
+services:
+  bot:
+    image: ghcr.io/<your-org>/<your-repo>:latest
+    container_name: discord-tts-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist saved settings/custom names and generated audio across
+      # restarts and redeploys, without masking the rest of /app (so
+      # new images from CI actually take effect).
+      - bot-data:/app/data
+      - tts-audio:/app/tts_audio
+
+volumes:
+  bot-data:
+  tts-audio:
