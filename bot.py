@@ -446,7 +446,26 @@ YTDL_OPTIONS = {
     "quiet": True,
     "default_search": "ytsearch1",  # bare queries -> take the first search hit
     "source_address": "0.0.0.0",
+    # YouTube is rolling out SABR-only streaming for some player clients,
+    # which withholds direct format URLs and causes "Requested format is
+    # not available" even though the video plays fine in a browser.
+    # android/ios clients still return direct URLs; web is kept as a
+    # fallback. See https://github.com/yt-dlp/yt-dlp/issues/12482
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android", "ios", "web"],
+        }
+    },
 }
+
+# YouTube sometimes demands sign-in verification, especially from
+# datacenter/VPS IPs, regardless of the video. Exporting cookies from a
+# logged-in browser session works around this. Set COOKIES_FILE to point
+# at an exported cookies.txt (Netscape format) if you hit
+# "Please sign in" errors. Left unset, yt-dlp just runs without cookies.
+COOKIES_FILE = os.getenv("COOKIES_FILE")
+if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+    YTDL_OPTIONS["cookiefile"] = COOKIES_FILE
 
 # Reconnect flags recommended by discord.py for long-lived network streams,
 # since a YouTube stream URL can drop mid-song.

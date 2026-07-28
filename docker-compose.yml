@@ -5,12 +5,21 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    # environment:
+    #   # Uncomment if you're mounting a cookies.txt (see the cookies.txt
+    #   # volume line below) to fix YouTube "Please sign in" errors.
+    #   - COOKIES_FILE=/app/cookies.txt
     volumes:
       # Persist saved settings/custom names and generated audio across
       # restarts and redeploys, without masking the rest of /app (so
       # new images from CI actually take effect).
       - bot-data:/app/data
       - tts-audio:/app/tts_audio
+      # Optional: export cookies from a logged-in YouTube browser session
+      # (e.g. with the "Get cookies.txt LOCALLY" extension) and place the
+      # file next to this compose file, then uncomment both this line and
+      # the COOKIES_FILE env var above.
+      # - ./cookies.txt:/app/cookies.txt
 
 volumes:
   bot-data:
