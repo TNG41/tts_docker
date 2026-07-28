@@ -289,7 +289,7 @@ class GuildMixer(discord.AudioSource):
             options=FFMPEG_STREAM_OPTIONS,
         )
         normal_volume = float(
-            guild_volumes.get(str(self.guild.id), MUSIC_NORMAL_VOLUME)
+            get_guild_setting(self.guild.id, "volume", MUSIC_NORMAL_VOLUME)
         )
 
         starting_volume = (
@@ -439,21 +439,17 @@ async def _make_audio_file_elevenlabs(text: str, path: str) -> None:
     with open(path, "wb") as f:
         f.write(data)
 
-
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
     "noplaylist": True,
     "quiet": True,
-    "default_search": "ytsearch1",  # bare queries -> take the first search hit
+    "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
-    # YouTube is rolling out SABR-only streaming for some player clients,
-    # which withholds direct format URLs and causes "Requested format is
-    # not available" even though the video plays fine in a browser.
-    # android/ios clients still return direct URLs; web is kept as a
-    # fallback. See https://github.com/yt-dlp/yt-dlp/issues/12482
+    "retries": 1,  # <--- Stop searching/retrying after 5 failed attempts
+    "fragment_retries": 1,  # <--- Max 5 retries for audio fragments
     "extractor_args": {
         "youtube": {
-            "player_client": ["android", "ios", "web"],
+            "player_client": ["mweb", "tv", "web"],
         }
     },
 }
@@ -592,17 +588,18 @@ async def queue_music(ctx: commands.Context, query: str):
         await ctx.send("I'm not in a voice channel.")
         return
 
-    status = await ctx.send(f"\U0001F50E Looking up **{query}**...")
+    status = await ctx.send(f"🔎 Looking up **{query}**...")
     try:
         info = await asyncio.to_thread(_extract_youtube_audio, query)
     except Exception as e:
-        await status.edit(content=f"Couldn't find or play that: {e}")
+        # Edit the status message to explicitly inform the user that it failed
+        await status.edit(content=f"❌ **Search failed for:** **{query}**\nReason: {e}")
         return
 
     mixer.queue_music({"source": info["url"], "title": info["title"]})
-    current_volume = int(
-        float(guild_volumes.get(str(ctx.guild.id), 1.0)) * 100
-    )
+    
+    vol = get_guild_setting(ctx.guild.id, "volume", MUSIC_NORMAL_VOLUME)
+    current_volume = int(float(vol) * 100)
 
     await status.edit(
         content=(
@@ -612,7 +609,6 @@ async def queue_music(ctx: commands.Context, query: str):
         )
     )
     _start_mixer_if_needed(ctx.guild)
-
 
 # ---------------------------------------------------------------------------
 # Commands
