@@ -464,7 +464,9 @@ class GuildMixer(discord.AudioSource):
 
     def _restore_volume(self):
         if self._music_source is not None:
-            self._music_source.volume = MUSIC_NORMAL_VOLUME
+            self._music_source.volume = float(
+                get_guild_setting(self.guild.id, "volume", MUSIC_NORMAL_VOLUME)
+            )
 
     # -- discord.AudioSource interface ---------------------------------
 
