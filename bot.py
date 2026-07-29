@@ -91,24 +91,11 @@ bound_text_channel: dict[int, int] = {}
 guild_mixers: dict[int, "GuildMixer"] = {}
 audio_file_counters: dict[int, int] = defaultdict(int)
 
-# Saved volume settings
+# Saved per-guild settings (volume, xsaid on/off, etc.)
 DATA_DIR = os.getenv("DATA_DIR", "data")
 os.makedirs(DATA_DIR, exist_ok=True)
-VOLUME_FILE = os.path.join(DATA_DIR, "setting.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "setting.json")
 
-
-def load_volumes():
-    if not os.path.exists(VOLUME_FILE):
-        return {}
-
-    with open(VOLUME_FILE, "r") as f:
-        return json.load(f)
-
-
-def save_volumes():
-    with open(VOLUME_FILE, "w") as f:
-        json.dump(guild_volumes, f, indent=4)
 
 def load_guild_settings() -> dict:
     if not os.path.exists(SETTINGS_FILE):
@@ -125,7 +112,6 @@ def save_guild_settings():
         json.dump(guild_settings, f, indent=4, ensure_ascii=False)
 
 guild_settings = load_guild_settings()
-guild_volumes = load_volumes()
 
 AUDIO_DIR = "tts_audio"
 os.makedirs(AUDIO_DIR, exist_ok=True)
@@ -140,7 +126,7 @@ NAMES_FILE = os.path.join(DATA_DIR, "user_names.json")
 def find_members(guild: discord.Guild, query: str) -> list[discord.Member]:
     """Find all members in the server matching display name, username, or nick."""
     query = query.lower().strip()
-    
+
     matches = []
     # Match if username or display name starts with or contains the query
     for member in guild.members:
@@ -163,7 +149,7 @@ async def prompt_member_selection(ctx: commands.Context, matches: list[discord.M
     for idx, member in enumerate(options, start=1):
         msg_content += f"`{idx}.` **{member.display_name}** (`@{member.name}`)\n"
 
-    prompt_msg = await ctx.send(msg_content)
+    await ctx.send(msg_content)
 
     def check(m: discord.Message):
         return m.author == ctx.author and m.channel == ctx.channel and m.content.isdigit()
@@ -242,6 +228,7 @@ class GuildMixer(discord.AudioSource):
         self._music_item: dict | None = None
         self._speech_source: discord.FFmpegPCMAudio | None = None
         self._speech_item: dict | None = None
+        self._paused = False
 
     # -- queueing -----------------------------------------------------
 
@@ -259,6 +246,18 @@ class GuildMixer(discord.AudioSource):
     def now_playing_title(self):
         return self._music_item.get("title") if self._music_item else None
 
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def pause(self):
+        """Freeze both lanes: read() will emit silence without consuming
+        from either source, so playback resumes exactly where it left off."""
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
     def clear_music(self):
         self.music_queue.clear()
         self._finish_music()
@@ -275,6 +274,12 @@ class GuildMixer(discord.AudioSource):
         elif self._music_source is not None:
             self._finish_music()
 
+    def skip_music(self):
+        """End the current track regardless of whether TTS is speaking
+        over it. Used by !skipto, which needs to jump within the music
+        queue without being blocked by an unrelated TTS clip."""
+        self._finish_music()
+
     # -- internal lane management --------------------------------------
 
     def _advance_music(self):
@@ -282,7 +287,25 @@ class GuildMixer(discord.AudioSource):
             self._music_item = None
             self._music_source = None
             return
-        self._music_item = self.music_queue.popleft()
+        item = self.music_queue.popleft()
+
+        if item.get("source") is None:
+            # Deferred playlist entry -- resolve to an actual stream URL
+            # now, rather than at queue time, so it's fresh. This runs on
+            # the voice player thread (not the event loop), same as the
+            # ffmpeg subprocess spawn just below, so it's fine to block
+            # here; it just means a short pause while this one track
+            # resolves instead of the whole playlist up front.
+            try:
+                resolved = _extract_youtube_audio(item["webpage_url"])
+                item["source"] = resolved["url"]
+                item["title"] = resolved.get("title", item["title"])
+            except Exception as e:
+                print(f"Skipping unplayable queued track '{item.get('title')}': {e}")
+                self._advance_music()  # try the next track instead of stalling
+                return
+
+        self._music_item = item
         ffmpeg_source = discord.FFmpegPCMAudio(
             self._music_item["source"],
             before_options=FFMPEG_STREAM_BEFORE_OPTIONS,
@@ -339,6 +362,9 @@ class GuildMixer(discord.AudioSource):
     # -- discord.AudioSource interface ---------------------------------
 
     def read(self) -> bytes:
+        if self._paused:
+            return SILENCE_FRAME
+
         if self._music_source is None and self.music_queue:
             self._advance_music()
         if self._speech_source is None and self.speech_queue:
@@ -472,13 +498,17 @@ FFMPEG_STREAM_OPTIONS = "-vn"
 
 
 def _extract_youtube_audio(query: str) -> dict:
-    """Resolve a search query or URL to a direct, playable audio stream URL.
+    """Resolve a single search query or URL to a playable audio stream.
 
     Runs in a worker thread (it's blocking network + parsing work).
     """
-    with yt_dlp.YoutubeDL(YTDL_OPTIONS) as ydl:
+    # Ensure noplaylist is True so !play only ever picks a single video
+    options = dict(YTDL_OPTIONS)
+    options["noplaylist"] = True
+
+    with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(query, download=False)
-        if "entries" in info:  # search results come back as a playlist-like dict
+        if "entries" in info:  # If a search term was used, grab the first hit
             if not info["entries"]:
                 raise RuntimeError("No results found.")
             info = info["entries"][0]
@@ -487,6 +517,113 @@ def _extract_youtube_audio(query: str) -> dict:
             "title": info.get("title", "Unknown title"),
             "webpage_url": info.get("webpage_url", query),
         }
+
+
+def _resolve_stream_source(url: str) -> dict:
+    """Resolve a link for !stream to a directly playable source.
+
+    Tries yt-dlp first, which handles YouTube videos, YouTube livestreams,
+    and many other sites (Twitch, SoundCloud, etc.). If yt-dlp doesn't
+    recognize the link at all -- e.g. a plain internet-radio/Icecast
+    stream -- falls back to handing the URL straight to ffmpeg, which can
+    play those formats directly without any resolving.
+    """
+    try:
+        return _extract_youtube_audio(url)
+    except Exception:
+        return {"url": url, "title": url, "webpage_url": url}
+
+
+# Max number of tracks !playlist will queue from a single playlist. Set to
+# None to remove the cap (not recommended -- large playlists can take a
+# long time to extract and will flood the queue).
+MAX_PLAYLIST_TRACKS = int(os.getenv("MAX_PLAYLIST_TRACKS", "30"))
+
+
+def _extract_youtube_playlist(query: str) -> list[dict]:
+    """Resolve a YouTube playlist URL (or playlist search) into multiple tracks.
+
+    Stops after MAX_PLAYLIST_TRACKS entries.
+    """
+    options = dict(YTDL_OPTIONS)
+    options["noplaylist"] = False
+    options["extract_flat"] = "in_playlist"  # Fast-extract track list info
+    if MAX_PLAYLIST_TRACKS:
+        # Tells yt-dlp to stop paging once it has this many entries, so we
+        # don't waste time/requests fetching tracks we'll just discard.
+        options["playlistend"] = MAX_PLAYLIST_TRACKS
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(query, download=False)
+
+        # Extract entries from a playlist dictionary
+        entries = info.get("entries") if "entries" in info else [info]
+        if not entries:
+            raise RuntimeError("No playlist entries found.")
+
+        tracks = []
+        for entry in entries:
+            if not entry:
+                continue
+            # extract_flat only gives lightweight metadata, not a playable
+            # audio stream URL -- entry["url"] here is just the video ID or
+            # webpage link, which ffmpeg can't play directly. Build a real
+            # watch-page URL and leave "source" unset; GuildMixer resolves
+            # it to an actual stream URL just before the track plays (see
+            # _advance_music), which also avoids stream URLs expiring for
+            # tracks that don't play until much later in a long playlist.
+            video_id = entry.get("id")
+            webpage_url = (
+                entry.get("webpage_url")
+                or (f"https://www.youtube.com/watch?v={video_id}" if video_id else None)
+                or entry.get("url")
+            )
+            if webpage_url:
+                tracks.append({
+                    "source": None,
+                    "webpage_url": webpage_url,
+                    "title": entry.get("title", "Unknown title"),
+                })
+            if MAX_PLAYLIST_TRACKS and len(tracks) >= MAX_PLAYLIST_TRACKS:
+                # Defensive: playlistend isn't always honored exactly by
+                # every YouTube extraction path, so also cap here.
+                break
+        return tracks
+
+async def queue_playlist(ctx: commands.Context, query: str):
+    """Resolve a playlist URL and add all its tracks to this guild's queue."""
+    mixer = guild_mixers.get(ctx.guild.id)
+    if mixer is None:
+        await ctx.send("I'm not in a voice channel.")
+        return
+
+    status = await ctx.send(f"🔎 Extracting playlist **{query}**...")
+    try:
+        tracks = await asyncio.to_thread(_extract_youtube_playlist, query)
+    except Exception as e:
+        error_msg = str(e) if str(e) else "Failed to load playlist."
+        await status.edit(content=f"❌ **Playlist search failed:**\nReason: {error_msg}")
+        return
+
+    for track in tracks:
+        mixer.queue_music(track)
+
+    vol = get_guild_setting(ctx.guild.id, "volume", MUSIC_NORMAL_VOLUME)
+    current_volume = int(float(vol) * 100)
+
+    capped_note = ""
+    if MAX_PLAYLIST_TRACKS and len(tracks) >= MAX_PLAYLIST_TRACKS:
+        capped_note = f"\n⚠️ Limited to the first **{MAX_PLAYLIST_TRACKS}** tracks."
+
+    await status.edit(
+        content=(
+            f"🎶 **Queued Playlist!** Added **{len(tracks)}** tracks.\n"
+            f"🔊 Volume: **{current_volume}%**\n"
+            f"📃 Total Queue: **{len(mixer.music_queue)}**"
+            f"{capped_note}"
+        )
+    )
+    _start_mixer_if_needed(ctx.guild)
 
 
 async def make_audio_file(text: str, guild_id: int, use_elevenlabs: bool) -> str:
@@ -597,7 +734,7 @@ async def queue_music(ctx: commands.Context, query: str):
         return
 
     mixer.queue_music({"source": info["url"], "title": info["title"]})
-    
+
     vol = get_guild_setting(ctx.guild.id, "volume", MUSIC_NORMAL_VOLUME)
     current_volume = int(float(vol) * 100)
 
@@ -609,6 +746,7 @@ async def queue_music(ctx: commands.Context, query: str):
         )
     )
     _start_mixer_if_needed(ctx.guild)
+
 
 # ---------------------------------------------------------------------------
 # Commands
@@ -683,6 +821,54 @@ async def play(ctx: commands.Context, *, query: str):
     await queue_music(ctx, query)
 
 
+@bot.command(aliases=["str"])
+async def stream(ctx: commands.Context, *, url: str):
+    """Stream a single link directly, replacing anything currently playing.
+
+    Unlike !play/!playlist, this always plays just one source at a time --
+    running !stream again drops whatever was playing/queued instead of
+    adding to it. Good for internet radio or live streams with no fixed end.
+    """
+    if ctx.author.voice is None or ctx.author.voice.channel is None:
+        await ctx.send("You need to be in a voice channel first.")
+        return
+
+    if ctx.voice_client is None:
+        await ctx.author.voice.channel.connect()
+        bound_text_channel.setdefault(ctx.guild.id, ctx.channel.id)
+
+    mixer = _ensure_mixer(ctx.guild)
+
+    status = await ctx.send(f"🔎 Resolving stream **{url}**...")
+    try:
+        info = await asyncio.to_thread(_resolve_stream_source, url)
+    except Exception as e:
+        await status.edit(content=f"❌ **Could not stream:** **{url}**\nReason: {e}")
+        return
+
+    # Only ever stream one thing at a time: drop anything queued/playing.
+    mixer.clear_music()
+    mixer.queue_music({"source": info["url"], "title": info["title"]})
+
+    await status.edit(content=f"📡 **Now streaming:** {info['title']}")
+    _start_mixer_if_needed(ctx.guild)
+
+
+@bot.command(aliases=["pl"])
+async def playlist(ctx: commands.Context, *, query: str):
+    """Queue an entire YouTube playlist."""
+    if ctx.author.voice is None or ctx.author.voice.channel is None:
+        await ctx.send("You need to be in a voice channel first.")
+        return
+
+    if ctx.voice_client is None:
+        await ctx.author.voice.channel.connect()
+        bound_text_channel.setdefault(ctx.guild.id, ctx.channel.id)
+
+    _ensure_mixer(ctx.guild)
+    await queue_playlist(ctx, query)
+
+
 @bot.command(aliases=["sk"])
 async def skip(ctx: commands.Context):
     """Skip the message or song currently playing."""
@@ -692,6 +878,49 @@ async def skip(ctx: commands.Context):
         await ctx.send("Skipped.")
     else:
         await ctx.send("Nothing is playing.")
+
+
+@bot.command(aliases=["jumpto", "goto"])
+async def skipto(ctx: commands.Context, position: int):
+    """Jump straight to track <position> in the queue (see !queue for numbers)."""
+    mixer = guild_mixers.get(ctx.guild.id)
+    if mixer is None or not mixer.music_queue:
+        await ctx.send("There's nothing queued to skip to.")
+        return
+
+    if position < 1 or position > len(mixer.music_queue):
+        await ctx.send(
+            f"Pick a number between 1 and {len(mixer.music_queue)} (see `!queue`)."
+        )
+        return
+
+    # Discard every track before the target one.
+    for _ in range(position - 1):
+        mixer.music_queue.popleft()
+
+    target_title = mixer.music_queue[0]["title"]
+    mixer.skip_music()  # ends the current track; the mixer auto-advances to the new front
+    await ctx.send(f"⏭️ Skipping to **{target_title}**.")
+
+
+@bot.command(aliases=["ins", "playnext"])
+async def insert(ctx: commands.Context, *, query: str):
+    """Look up a track and put it at the front of the queue to play next."""
+    mixer = guild_mixers.get(ctx.guild.id)
+    if mixer is None:
+        await ctx.send("I'm not in a voice channel. Use `!join` or `!play` first.")
+        return
+
+    status = await ctx.send(f"🔎 Looking up **{query}**...")
+    try:
+        info = await asyncio.to_thread(_extract_youtube_audio, query)
+    except Exception as e:
+        await status.edit(content=f"❌ **Search failed for:** **{query}**\nReason: {e}")
+        return
+
+    mixer.music_queue.appendleft({"source": info["url"], "title": info["title"]})
+    await status.edit(content=f"⏩ **{info['title']}** will play next.")
+    _start_mixer_if_needed(ctx.guild)
 
 
 @bot.command(aliases=["st"])
@@ -955,7 +1184,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
         # If no humans are left in the channel, disconnect
         if len(human_members) == 0:
             guild_id = member.guild.id
-            
+
             # Disconnect and clean up state
             await voice_client.disconnect()
             bound_text_channel.pop(guild_id, None)
