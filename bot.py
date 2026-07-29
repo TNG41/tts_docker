@@ -252,7 +252,6 @@ class GuildMixer(discord.AudioSource):
 
         self._music_source: discord.PCMVolumeTransformer | None = None
         self._music_item: dict | None = None
-        self._music_frames_played = 0
         self._speech_source: discord.FFmpegPCMAudio | None = None
         self._speech_item: dict | None = None
         self._paused = False
@@ -286,12 +285,6 @@ class GuildMixer(discord.AudioSource):
     @property
     def now_playing_title(self):
         return self._music_item.get("title") if self._music_item else None
-
-    @property
-    def is_idle(self) -> bool:
-        """True if nothing is currently playing and nothing is queued --
-        i.e. the next !play would start immediately."""
-        return self._music_item is None and not self.music_queue
 
     @property
     def is_paused(self) -> bool:
@@ -411,7 +404,6 @@ class GuildMixer(discord.AudioSource):
             else normal_volume
         )
         self._music_source = discord.PCMVolumeTransformer(ffmpeg_source, volume=starting_volume)
-        self._music_frames_played = 0
         self._announce_now_playing(item)
 
     def _announce_now_playing(self, item: dict):
@@ -474,52 +466,6 @@ class GuildMixer(discord.AudioSource):
         if self._music_source is not None:
             self._music_source.volume = MUSIC_NORMAL_VOLUME
 
-    def swap_music_source(self, item_id: str, new_path: str, new_title: str | None = None):
-        """Switch a track from its live stream URL to a downloaded local
-        file once the background download finishes, seeking to the
-        current playback position so there's no restart/glitch.
-
-        If the track hasn't started playing yet (still queued), just
-        updates it in place instead. If it's already moved on (skipped,
-        finished) before the download completed, this is a no-op --
-        the caller is still responsible for cleaning up new_path in
-        that case.
-        """
-        with self._lock:
-            for queued_item in self.music_queue:
-                if queued_item.get("id") == item_id:
-                    queued_item["source"] = new_path
-                    queued_item["is_stream"] = False
-                    queued_item["cleanup"] = True
-                    if new_title:
-                        queued_item["title"] = new_title
-                    return True
-
-            if self._music_item is None or self._music_item.get("id") != item_id:
-                return False
-
-            elapsed = self._music_frames_played * (FRAME_BYTES / (48000 * 2 * 2))
-            try:
-                new_ffmpeg_source = discord.FFmpegPCMAudio(
-                    new_path, before_options=f"-ss {elapsed:.2f}"
-                )
-            except Exception as e:
-                print(f"Swap to downloaded file failed: {e}")
-                return False
-
-            old_source = self._music_source
-            volume = old_source.volume if old_source is not None else MUSIC_NORMAL_VOLUME
-            self._music_source = discord.PCMVolumeTransformer(new_ffmpeg_source, volume=volume)
-            if old_source is not None:
-                old_source.cleanup()
-
-            self._music_item["source"] = new_path
-            self._music_item["is_stream"] = False
-            self._music_item["cleanup"] = True
-            if new_title:
-                self._music_item["title"] = new_title
-            return True
-
     # -- discord.AudioSource interface ---------------------------------
 
     def read(self) -> bytes:
@@ -535,8 +481,6 @@ class GuildMixer(discord.AudioSource):
         if self._music_source is not None:
             with self._lock:
                 music_bytes = self._music_source.read()
-            if music_bytes:
-                self._music_frames_played += 1
             if not music_bytes:
                 self._finish_music()
                 self._advance_music()
@@ -1104,54 +1048,18 @@ async def queue_speech(guild: discord.Guild, text: str, is_owner: bool = False):
 
 
 async def queue_music(ctx: commands.Context, query: str):
-    """Add a YouTube query/URL to this guild's music lane.
-
-    If nothing is currently playing, starts playback immediately from
-    a live stream URL (fast) and swaps to a downloaded local file in
-    the background once ready, for stutter-free playback going
-    forward. If something's already playing, just downloads normally
-    ahead of its turn -- there's no perceptible wait either way since
-    it won't play until the current track finishes.
-    """
+    """Resolve a YouTube query/URL, download its audio, and add it to
+    this guild's music lane. Downloads happen before the track is
+    queued/played so playback always reads from a stable local file --
+    streaming the raw googlevideo URL live is prone to YouTube
+    throttling/dropping the connection mid-song, which causes audible
+    stutter even once ffmpeg reconnects."""
     mixer = guild_mixers.get(ctx.guild.id)
     if mixer is None:
         await ctx.send("I'm not in a voice channel.", silent=True)
         return
 
-    starts_immediately = mixer.is_idle
-
     status = await ctx.send(f"🔎 Looking up **{query}**...", silent=True)
-
-    if starts_immediately:
-        try:
-            info = await asyncio.to_thread(_extract_youtube_audio, query)
-        except Exception as e:
-            await status.edit(content=f"❌ **Search failed for:** **{query}**\nReason: {e}")
-            return
-
-        item_id = uuid.uuid4().hex
-        mixer.queue_music({
-            "id": item_id,
-            "source": info["url"],
-            "title": info["title"],
-            "webpage_url": info["webpage_url"],
-            "is_stream": True,
-            "cleanup": False,
-        })
-
-        vol = get_guild_setting(ctx.guild.id, "volume", MUSIC_NORMAL_VOLUME)
-        current_volume = int(float(vol) * 100)
-        await status.edit(
-            content=(
-                f"🎵 Playing now: **{info['title']}**\n"
-                f"🔊 Volume: **{current_volume}%**\n"
-                f"⏳ Fetching a stable copy in the background..."
-            )
-        )
-        _start_mixer_if_needed(ctx.guild)
-
-        asyncio.create_task(_download_and_swap(mixer, item_id, info["webpage_url"]))
-        return
 
     try:
         info = await asyncio.to_thread(_download_youtube_audio, query)
@@ -1174,26 +1082,6 @@ async def queue_music(ctx: commands.Context, query: str):
     _start_mixer_if_needed(ctx.guild)
 
 
-async def _download_and_swap(mixer: "GuildMixer", item_id: str, webpage_url: str):
-    """Background task: download the actual audio file for a track that
-    started playing from a live stream URL, then hot-swap the mixer over
-    to it once ready. If the swap doesn't happen (track already moved on
-    before the download finished), clean up the downloaded file instead
-    of leaving it orphaned on disk."""
-    try:
-        resolved = await asyncio.to_thread(_download_youtube_audio, webpage_url)
-    except Exception as e:
-        print(f"Background download for swap failed: {e}")
-        return
-
-    swapped = mixer.swap_music_source(item_id, resolved["path"], resolved.get("title"))
-    if not swapped:
-        try:
-            os.remove(resolved["path"])
-        except OSError:
-            pass
-
-
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -1212,7 +1100,7 @@ async def join(ctx: commands.Context):
 
     channel = ctx.author.voice.channel
     if ctx.voice_client is None:
-        await channel.connect()
+        await channel.connect(self_deaf=True)
     else:
         await ctx.voice_client.move_to(channel)
 
@@ -1251,7 +1139,7 @@ async def tts(ctx: commands.Context, *, text: str):
     await queue_speech(ctx.guild, full_text, is_owner=is_owner)
 
 
-@bot.command(aliases=["ask", "gpt"])
+@bot.command(aliases=["ask", "gpt", "c"])
 async def chat(ctx: commands.Context, *, message: str):
     """Ask the AI chatbot something. Replies in chat, and speaks the
     answer aloud too -- joining your voice channel first if I'm not
@@ -1259,7 +1147,7 @@ async def chat(ctx: commands.Context, *, message: str):
 
     You can also just @mention me instead of using this command."""
     if ctx.voice_client is None and ctx.author.voice is not None and ctx.author.voice.channel is not None:
-        await ctx.author.voice.channel.connect()
+        await ctx.author.voice.channel.connect(self_deaf=True)
         bound_text_channel.setdefault(ctx.guild.id, ctx.channel.id)
         _ensure_mixer(ctx.guild)
 
@@ -1339,7 +1227,7 @@ async def play(ctx: commands.Context, *, query: str):
         return
 
     if ctx.voice_client is None:
-        await ctx.author.voice.channel.connect()
+        await ctx.author.voice.channel.connect(self_deaf=True)
         # Bind this text channel too, so TTS also works without a separate !join.
         bound_text_channel.setdefault(ctx.guild.id, ctx.channel.id)
 
@@ -1360,7 +1248,7 @@ async def stream(ctx: commands.Context, *, url: str):
         return
 
     if ctx.voice_client is None:
-        await ctx.author.voice.channel.connect()
+        await ctx.author.voice.channel.connect(self_deaf=True)
         bound_text_channel.setdefault(ctx.guild.id, ctx.channel.id)
 
     mixer = _ensure_mixer(ctx.guild)
@@ -1388,7 +1276,7 @@ async def playlist(ctx: commands.Context, *, query: str):
         return
 
     if ctx.voice_client is None:
-        await ctx.author.voice.channel.connect()
+        await ctx.author.voice.channel.connect(self_deaf=True)
         bound_text_channel.setdefault(ctx.guild.id, ctx.channel.id)
 
     _ensure_mixer(ctx.guild)
@@ -1620,7 +1508,7 @@ async def said(ctx: commands.Context, *, text: str):
             await ctx.send("You need to be in a voice channel first.")
             return
 
-        await ctx.author.voice.channel.connect()
+        await ctx.author.voice.channel.connect(self_deaf=True)
         bound_text_channel.setdefault(ctx.guild.id, ctx.channel.id)
 
     _ensure_mixer(ctx.guild)
@@ -1687,16 +1575,24 @@ def _is_owner_or_can_manage_channels(ctx: commands.Context) -> bool:
 
 @bot.command(aliases=["fj"])
 @commands.check(_is_owner_or_can_manage_channels)
-async def forcejoin(ctx: commands.Context, *, channel_input: str):
-    """Make the bot join a voice channel by ID or Name, even if you aren't in it."""
-    target_channel = _find_voice_channel(ctx.guild, channel_input)
+async def forcejoin(ctx: commands.Context, *, channel_input: str = None):
+    """Make the bot join a voice channel by ID or Name.
+    If no channel is given, joins whichever voice channel you're currently in.
+    """
+    if channel_input is None:
+        if ctx.author.voice is None or ctx.author.voice.channel is None:
+            await ctx.send("❌ You're not in a voice channel — specify one: `!fj <channel name or ID>`.")
+            return
+        target_channel = ctx.author.voice.channel
+    else:
+        target_channel = _find_voice_channel(ctx.guild, channel_input)
 
     if target_channel is None:
         await ctx.send(f"❌ Voice channel `{channel_input}` not found.")
         return
 
     if ctx.voice_client is None:
-        await target_channel.connect()
+        await target_channel.connect(self_deaf=True)
     else:
         await ctx.voice_client.move_to(target_channel)
 
@@ -1770,7 +1666,7 @@ async def on_message(message: discord.Message):
         and message.author.voice is not None
         and message.author.voice.channel is not None
     ):
-        voice_client = await message.author.voice.channel.connect()
+        voice_client = await message.author.voice.channel.connect(self_deaf=True)
         bound_text_channel[message.guild.id] = message.channel.id
         _ensure_mixer(message.guild)
         await message.channel.send(
