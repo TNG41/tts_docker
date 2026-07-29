@@ -428,7 +428,7 @@ class GuildMixer(discord.AudioSource):
             return
         title = item.get("title", "Unknown title")
         asyncio.run_coroutine_threadsafe(
-            channel.send(f"🎶 **Now Playing:** {title}"), bot.loop
+            channel.send(f"🎶 **Now Playing:** {title}", silent=True), bot.loop
         )
 
     def _finish_music(self):
@@ -978,10 +978,10 @@ async def queue_playlist(ctx: commands.Context, query: str):
     """Resolve a playlist URL and add all its tracks to this guild's queue."""
     mixer = guild_mixers.get(ctx.guild.id)
     if mixer is None:
-        await ctx.send("I'm not in a voice channel.")
+        await ctx.send("I'm not in a voice channel.", silent=True)
         return
 
-    status = await ctx.send(f"🔎 Extracting playlist **{query}**...")
+    status = await ctx.send(f"🔎 Extracting playlist **{query}**...", silent=True)
     try:
         tracks = await asyncio.to_thread(_extract_youtube_playlist, query)
     except Exception as e:
@@ -1115,12 +1115,12 @@ async def queue_music(ctx: commands.Context, query: str):
     """
     mixer = guild_mixers.get(ctx.guild.id)
     if mixer is None:
-        await ctx.send("I'm not in a voice channel.")
+        await ctx.send("I'm not in a voice channel.", silent=True)
         return
 
     starts_immediately = mixer.is_idle
 
-    status = await ctx.send(f"🔎 Looking up **{query}**...")
+    status = await ctx.send(f"🔎 Looking up **{query}**...", silent=True)
 
     if starts_immediately:
         try:
@@ -1237,14 +1237,14 @@ async def leave(ctx: commands.Context):
             mixer.cleanup()
         await ctx.send("Left the voice channel.")
     else:
-        await ctx.send("I'm not in a voice channel.")
+        await ctx.send("I'm not in a voice channel.", silent=True)
 
 
 @bot.command()
 async def tts(ctx: commands.Context, *, text: str):
     """Force-read a specific piece of text."""
     if ctx.voice_client is None:
-        await ctx.send("I'm not in a voice channel. Use `!join` first.")
+        await ctx.send("I'm not in a voice channel. Use `!join` first.", silent=True)
         return
     is_owner = OWNER_USER_ID is not None and ctx.author.id == OWNER_USER_ID
     full_text = format_speech_text(ctx.guild.id, ctx.author, text)
@@ -1335,7 +1335,7 @@ async def preset(ctx: commands.Context, action: str = None, *, rest: str = None)
 async def play(ctx: commands.Context, *, query: str):
     """Search YouTube (or take a direct URL) and queue it for playback."""
     if ctx.author.voice is None or ctx.author.voice.channel is None:
-        await ctx.send("You need to be in a voice channel first.")
+        await ctx.send("You need to be in a voice channel first.", silent=True)
         return
 
     if ctx.voice_client is None:
@@ -1356,7 +1356,7 @@ async def stream(ctx: commands.Context, *, url: str):
     adding to it. Good for internet radio or live streams with no fixed end.
     """
     if ctx.author.voice is None or ctx.author.voice.channel is None:
-        await ctx.send("You need to be in a voice channel first.")
+        await ctx.send("You need to be in a voice channel first.", silent=True)
         return
 
     if ctx.voice_client is None:
@@ -1365,7 +1365,7 @@ async def stream(ctx: commands.Context, *, url: str):
 
     mixer = _ensure_mixer(ctx.guild)
 
-    status = await ctx.send(f"🔎 Resolving stream **{url}**...")
+    status = await ctx.send(f"🔎 Resolving stream **{url}**...", silent=True)
     try:
         info = await asyncio.to_thread(_resolve_stream_source, url)
     except Exception as e:
@@ -1384,7 +1384,7 @@ async def stream(ctx: commands.Context, *, url: str):
 async def playlist(ctx: commands.Context, *, query: str):
     """Queue an entire YouTube playlist."""
     if ctx.author.voice is None or ctx.author.voice.channel is None:
-        await ctx.send("You need to be in a voice channel first.")
+        await ctx.send("You need to be in a voice channel first.", silent=True)
         return
 
     if ctx.voice_client is None:
@@ -1401,9 +1401,9 @@ async def skip(ctx: commands.Context):
     mixer = guild_mixers.get(ctx.guild.id)
     if mixer is not None and mixer.is_active:
         mixer.skip_current()
-        await ctx.send("Skipped.")
+        await ctx.send("Skipped.", silent=True)
     else:
-        await ctx.send("Nothing is playing.")
+        await ctx.send("Nothing is playing.", silent=True)
 
 
 @bot.command(aliases=["jumpto", "goto"])
@@ -1411,23 +1411,24 @@ async def skipto(ctx: commands.Context, position: int):
     """Jump straight to track <position> in the queue (see !queue for numbers)."""
     mixer = guild_mixers.get(ctx.guild.id)
     if mixer is None or not mixer.music_queue:
-        await ctx.send("There's nothing queued to skip to.")
+        await ctx.send("There's nothing queued to skip to.", silent=True)
         return
 
     if position < 1 or position > len(mixer.music_queue):
         await ctx.send(
-            f"Pick a number between 1 and {len(mixer.music_queue)} (see `!queue`)."
+            f"Pick a number between 1 and {len(mixer.music_queue)} (see `!queue`).",
+            silent=True,
         )
         return
 
     # Discard every track before the target one.
     target_title = mixer.discard_upcoming(position - 1)
     if target_title is None:
-        await ctx.send("The queue changed before I could skip there — try again.")
+        await ctx.send("The queue changed before I could skip there — try again.", silent=True)
         return
 
     mixer.skip_music()  # ends the current track; the mixer auto-advances to the new front
-    await ctx.send(f"⏭️ Skipping to **{target_title}**.")
+    await ctx.send(f"⏭️ Skipping to **{target_title}**.", silent=True)
 
 
 @bot.command(aliases=["ins", "playnext"])
@@ -1435,10 +1436,10 @@ async def insert(ctx: commands.Context, *, query: str):
     """Look up a track and put it at the front of the queue to play next."""
     mixer = guild_mixers.get(ctx.guild.id)
     if mixer is None:
-        await ctx.send("I'm not in a voice channel. Use `!join` or `!play` first.")
+        await ctx.send("I'm not in a voice channel. Use `!join` or `!play` first.", silent=True)
         return
 
-    status = await ctx.send(f"🔎 Looking up **{query}**...")
+    status = await ctx.send(f"🔎 Looking up **{query}**...", silent=True)
     try:
         info = await asyncio.to_thread(_download_youtube_audio, query)
     except Exception as e:
@@ -1457,19 +1458,19 @@ async def stop(ctx: commands.Context):
     if mixer is not None:
         mixer.clear_music()
         mixer.clear_speech()
-    await ctx.send("Stopped and cleared the queue.")
+    await ctx.send("Stopped and cleared the queue.", silent=True)
 
 @bot.command(aliases=["q"])
 async def queue(ctx: commands.Context):
     """Display the current music queue."""
     mixer = guild_mixers.get(ctx.guild.id)
     if mixer is None:
-        await ctx.send("The queue is currently empty.")
+        await ctx.send("The queue is currently empty.", silent=True)
         return
 
     upcoming = mixer.snapshot_queue()
     if not mixer.now_playing_title and not upcoming:
-        await ctx.send("The queue is currently empty.")
+        await ctx.send("The queue is currently empty.", silent=True)
         return
 
     msg = ""
@@ -1486,7 +1487,7 @@ async def queue(ctx: commands.Context):
     else:
         msg += "*No remaining tracks in queue.*"
 
-    await ctx.send(msg)
+    await ctx.send(msg, silent=True)
 
 
 @bot.command(aliases=["np"])
@@ -1495,9 +1496,9 @@ async def nowplaying(ctx: commands.Context):
     mixer = guild_mixers.get(ctx.guild.id)
     if mixer and mixer.now_playing_title:
         status = " (Paused)" if mixer.is_paused else ""
-        await ctx.send(f"🎶 **Now Playing:** {mixer.now_playing_title}{status}")
+        await ctx.send(f"🎶 **Now Playing:** {mixer.now_playing_title}{status}", silent=True)
     else:
-        await ctx.send("Nothing is currently playing.")
+        await ctx.send("Nothing is currently playing.", silent=True)
 
 
 @bot.command()
@@ -1506,11 +1507,11 @@ async def pause(ctx: commands.Context):
     mixer = guild_mixers.get(ctx.guild.id)
     if mixer is not None and not mixer.is_paused:
         mixer.pause()
-        await ctx.send("⏸️ Paused playback.")
+        await ctx.send("⏸️ Paused playback.", silent=True)
     elif mixer and mixer.is_paused:
-        await ctx.send("Playback is already paused.")
+        await ctx.send("Playback is already paused.", silent=True)
     else:
-        await ctx.send("Nothing is playing to pause.")
+        await ctx.send("Nothing is playing to pause.", silent=True)
 
 
 @bot.command()
@@ -1519,17 +1520,17 @@ async def resume(ctx: commands.Context):
     mixer = guild_mixers.get(ctx.guild.id)
     if mixer is not None and mixer.is_paused:
         mixer.resume()
-        await ctx.send("▶️ Resumed playback.")
+        await ctx.send("▶️ Resumed playback.", silent=True)
     elif mixer and not mixer.is_paused:
-        await ctx.send("Playback is not paused.")
+        await ctx.send("Playback is not paused.", silent=True)
     else:
-        await ctx.send("Nothing is paused.")
+        await ctx.send("Nothing is paused.", silent=True)
 
 @bot.command(aliases=["v", "vol"])
 async def volume(ctx: commands.Context, level: int):
     """Set music volume (0-100%)."""
     if level < 0 or level > 100:
-        await ctx.send("Volume must be between 0 and 100.")
+        await ctx.send("Volume must be between 0 and 100.", silent=True)
         return
 
     vol = level / 100
@@ -1539,7 +1540,7 @@ async def volume(ctx: commands.Context, level: int):
     if mixer and mixer._music_source:
         mixer._music_source.volume = vol
 
-    await ctx.send(f"🔊 Volume set to **{level}%**")
+    await ctx.send(f"🔊 Volume set to **{level}%**", silent=True)
 
 @bot.command(aliases=["setname", "customname"])
 async def name(ctx: commands.Context, target_input: str = None, *, custom_name: str = None):
@@ -1654,6 +1655,83 @@ async def xsaidtoggle(ctx: commands.Context, mode: str = None):
     set_guild_setting(ctx.guild.id, "xsaid_enabled", new_state)
     status_str = "**ENABLED** 🟢" if new_state else "**DISABLED** 🔴"
     await ctx.send(f"`!xsaid` feature is now {status_str} for this server.")
+
+def _find_voice_channel(guild: discord.Guild, channel_input: str) -> discord.VoiceChannel | None:
+    """Find a voice channel by ID, exact name (case-insensitive), or partial name match."""
+    # Try by ID first
+    if channel_input.isdigit():
+        channel = guild.get_channel(int(channel_input))
+        if isinstance(channel, discord.VoiceChannel):
+            return channel
+
+    query = channel_input.lower().strip()
+
+    # Exact name match, case-insensitive
+    for vc in guild.voice_channels:
+        if vc.name.lower() == query:
+            return vc
+
+    # Partial/substring match, case-insensitive
+    partial_matches = [vc for vc in guild.voice_channels if query in vc.name.lower()]
+    if len(partial_matches) == 1:
+        return partial_matches[0]
+
+    return None
+
+
+def _is_owner_or_can_manage_channels(ctx: commands.Context) -> bool:
+    if OWNER_USER_ID is not None and ctx.author.id == OWNER_USER_ID:
+        return True
+    return ctx.author.guild_permissions.manage_channels
+
+
+@bot.command(aliases=["fj"])
+@commands.check(_is_owner_or_can_manage_channels)
+async def forcejoin(ctx: commands.Context, *, channel_input: str):
+    """Make the bot join a voice channel by ID or Name, even if you aren't in it."""
+    target_channel = _find_voice_channel(ctx.guild, channel_input)
+
+    if target_channel is None:
+        await ctx.send(f"❌ Voice channel `{channel_input}` not found.")
+        return
+
+    if ctx.voice_client is None:
+        await target_channel.connect()
+    else:
+        await ctx.voice_client.move_to(target_channel)
+
+    _ensure_mixer(ctx.guild)
+    _start_mixer_if_needed(ctx.guild)
+
+    bound_text_channel[ctx.guild.id] = ctx.channel.id
+    await ctx.send(f"Joined **{target_channel.name}** and bound to **#{ctx.channel.name}**.")
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    """Global fallback so bad input doesn't crash with a raw traceback."""
+    if isinstance(error, commands.CommandNotFound):
+        return  # silently ignore unknown commands
+
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Missing argument: `{error.param.name}`. Usage: `!{ctx.command.qualified_name} {ctx.command.signature}`")
+        return
+
+    if isinstance(error, commands.BadArgument):
+        await ctx.send(f"❌ Invalid argument. Usage: `!{ctx.command.qualified_name} {ctx.command.signature}`")
+        return
+
+    if isinstance(error, (commands.CheckFailure, commands.NotOwner)):
+        await ctx.send("🔒 You don't have permission to use this command.")
+        return
+
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(f"⏳ That command is on cooldown. Try again in {error.retry_after:.1f}s.")
+        return
+
+    # Anything else: log it and let the user know something went wrong,
+    # without leaking a stack trace into the channel.
+    print(f"Unhandled error in command {ctx.command}: {error!r}")
+    await ctx.send("⚠️ Something went wrong running that command.")
 
 @bot.event
 async def on_message(message: discord.Message):
