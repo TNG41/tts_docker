@@ -11,7 +11,9 @@ import array
 import asyncio
 import os
 import json
+import threading
 import time
+import uuid
 from collections import defaultdict, deque
 
 import aiohttp
@@ -73,6 +75,30 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
 # model, so quality/behavior may shift over time, but it's the only
 # current option that will actually speak Thai text correctly.
 ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_v3")
+
+# Chatbot (used by !chat/!ask and @mentioning the bot). Uses any
+# OpenAI-compatible chat completions API. Defaults to Groq, which has a
+# free tier -- get a key at https://console.groq.com/keys
+#
+# To use a different provider instead, set CHATBOT_API_BASE / _MODEL /
+# _API_KEY accordingly, e.g.:
+#   OpenAI:      https://api.openai.com/v1        gpt-4o-mini
+#   OpenRouter:  https://openrouter.ai/api/v1      meta-llama/llama-3.1-8b-instruct:free
+#   Ollama:      http://localhost:11434/v1         llama3.1 (no key needed)
+CHATBOT_API_BASE = os.getenv("CHATBOT_API_BASE", "https://api.groq.com/openai/v1")
+CHATBOT_MODEL = os.getenv("CHATBOT_MODEL", "llama-3.3-70b-versatile")
+CHATBOT_API_KEY = os.getenv("CHATBOT_API_KEY", os.getenv("GROQ_API_KEY", ""))
+CHATBOT_SYSTEM_PROMPT = os.getenv(
+    "CHATBOT_SYSTEM_PROMPT",
+    "You're chatting in a Discord voice channel like one of the group's "
+    "friends, not a customer service bot. Talk casual -- short, "
+    "conversational replies, no corporate politeness, no over-explaining. "
+    "Swearing is fine if it fits naturally, don't force it. Give real "
+    "opinions and push back if someone's wrong instead of hedging. "
+    "Replies are also read aloud with text-to-speech, so keep them short.",
+)
+# How many past user/assistant exchanges to remember per channel for context.
+CHAT_HISTORY_TURNS = int(os.getenv("CHAT_HISTORY_TURNS", "6"))
 
 # ---------------------------------------------------------------------------
 # Bot setup
@@ -226,14 +252,29 @@ class GuildMixer(discord.AudioSource):
 
         self._music_source: discord.PCMVolumeTransformer | None = None
         self._music_item: dict | None = None
+        self._music_frames_played = 0
         self._speech_source: discord.FFmpegPCMAudio | None = None
         self._speech_item: dict | None = None
         self._paused = False
 
+        # music_queue is touched from three different threads: the event
+        # loop (commands adding tracks), the voice player thread (popping
+        # the next track in _advance_music), and the prefetch task's
+        # worker threads (downloading tracks in the background). This
+        # lock guards every read/mutation of the deque itself.
+        self._lock = threading.Lock()
+        self.active = True  # flips to False in cleanup() to stop prefetching
+        self.prefetch_task: asyncio.Task | None = None
+
     # -- queueing -----------------------------------------------------
 
     def queue_music(self, item: dict):
-        self.music_queue.append(item)
+        with self._lock:
+            self.music_queue.append(item)
+
+    def insert_next(self, item: dict):
+        with self._lock:
+            self.music_queue.appendleft(item)
 
     def queue_speech(self, item: dict):
         self.speech_queue.append(item)
@@ -247,6 +288,12 @@ class GuildMixer(discord.AudioSource):
         return self._music_item.get("title") if self._music_item else None
 
     @property
+    def is_idle(self) -> bool:
+        """True if nothing is currently playing and nothing is queued --
+        i.e. the next !play would start immediately."""
+        return self._music_item is None and not self.music_queue
+
+    @property
     def is_paused(self) -> bool:
         return self._paused
 
@@ -258,8 +305,19 @@ class GuildMixer(discord.AudioSource):
     def resume(self):
         self._paused = False
 
+    @staticmethod
+    def _discard_music_item(item: dict):
+        """Delete a queued (not-yet-played) track's downloaded file, if any."""
+        if item.get("cleanup") and item.get("source"):
+            try:
+                os.remove(item["source"])
+            except OSError:
+                pass
+
     def clear_music(self):
-        self.music_queue.clear()
+        with self._lock:
+            while self.music_queue:
+                self._discard_music_item(self.music_queue.popleft())
         self._finish_music()
 
     def clear_speech(self):
@@ -280,37 +338,69 @@ class GuildMixer(discord.AudioSource):
         queue without being blocked by an unrelated TTS clip."""
         self._finish_music()
 
+    def discard_upcoming(self, count: int) -> str | None:
+        """Drop the next `count` queued (not-yet-playing) tracks, cleaning
+        up any already-downloaded files. Used by !skipto. Returns the
+        title of whatever's now at the front of the queue, if any."""
+        with self._lock:
+            for _ in range(count):
+                if not self.music_queue:
+                    break
+                self._discard_music_item(self.music_queue.popleft())
+            return self.music_queue[0]["title"] if self.music_queue else None
+
+    def snapshot_queue(self) -> list[dict]:
+        """A thread-safe copy of the queue's current contents, for display
+        (e.g. !queue) without racing the player/prefetch threads."""
+        with self._lock:
+            return list(self.music_queue)
+
     # -- internal lane management --------------------------------------
 
     def _advance_music(self):
-        if not self.music_queue:
-            self._music_item = None
-            self._music_source = None
+        with self._lock:
+            if not self.music_queue:
+                self._music_item = None
+                self._music_source = None
+                return
+            item = self.music_queue.popleft()
+
+        if item.get("source") == UNPLAYABLE:
+            # The background prefetch task already tried and failed to
+            # download this one -- don't retry, just move on.
+            print(f"Skipping unplayable queued track '{item.get('title')}'")
+            self._advance_music()
             return
-        item = self.music_queue.popleft()
 
         if item.get("source") is None:
-            # Deferred playlist entry -- resolve to an actual stream URL
-            # now, rather than at queue time, so it's fresh. This runs on
-            # the voice player thread (not the event loop), same as the
-            # ffmpeg subprocess spawn just below, so it's fine to block
-            # here; it just means a short pause while this one track
-            # resolves instead of the whole playlist up front.
+            # Deferred playlist entry the prefetch task hasn't reached yet
+            # (e.g. it's further out than PREFETCH_AHEAD, or the bot just
+            # started). Fall back to downloading it right now. This runs
+            # on the voice player thread, so it's fine to block here; it
+            # just means a short pause for this one track instead of it
+            # already being ready.
             try:
-                resolved = _extract_youtube_audio(item["webpage_url"])
-                item["source"] = resolved["url"]
+                resolved = _download_youtube_audio(item["webpage_url"])
+                item["source"] = resolved["path"]
                 item["title"] = resolved.get("title", item["title"])
+                item["cleanup"] = True
             except Exception as e:
                 print(f"Skipping unplayable queued track '{item.get('title')}': {e}")
                 self._advance_music()  # try the next track instead of stalling
                 return
 
         self._music_item = item
-        ffmpeg_source = discord.FFmpegPCMAudio(
-            self._music_item["source"],
-            before_options=FFMPEG_STREAM_BEFORE_OPTIONS,
-            options=FFMPEG_STREAM_OPTIONS,
-        )
+        if item.get("is_stream"):
+            # Live/unbounded streams (see !stream) still play directly from
+            # their URL, so keep the reconnect flags for network hiccups.
+            ffmpeg_source = discord.FFmpegPCMAudio(
+                self._music_item["source"],
+                before_options=FFMPEG_STREAM_BEFORE_OPTIONS,
+                options=FFMPEG_STREAM_OPTIONS,
+            )
+        else:
+            # Downloaded local file -- no network involved during playback.
+            ffmpeg_source = discord.FFmpegPCMAudio(self._music_item["source"])
         normal_volume = float(
             get_guild_setting(self.guild.id, "volume", MUSIC_NORMAL_VOLUME)
         )
@@ -321,12 +411,37 @@ class GuildMixer(discord.AudioSource):
             else normal_volume
         )
         self._music_source = discord.PCMVolumeTransformer(ffmpeg_source, volume=starting_volume)
+        self._music_frames_played = 0
+        self._announce_now_playing(item)
+
+    def _announce_now_playing(self, item: dict):
+        """Post a "Now Playing" message for a track that just started,
+        whether it's the first one queued or an automatic transition
+        after the previous song ended. Runs on the voice player thread,
+        so the send is scheduled onto the bot's event loop instead of
+        awaited directly."""
+        channel_id = bound_text_channel.get(self.guild.id)
+        if channel_id is None:
+            return
+        channel = self.guild.get_channel(channel_id)
+        if channel is None:
+            return
+        title = item.get("title", "Unknown title")
+        asyncio.run_coroutine_threadsafe(
+            channel.send(f"🎶 **Now Playing:** {title}"), bot.loop
+        )
 
     def _finish_music(self):
+        item = self._music_item
         if self._music_source is not None:
             self._music_source.cleanup()
         self._music_item = None
         self._music_source = None
+        if item is not None and item.get("cleanup"):
+            try:
+                os.remove(item["source"])
+            except OSError:
+                pass
 
     def _advance_speech(self):
         if not self.speech_queue:
@@ -359,6 +474,52 @@ class GuildMixer(discord.AudioSource):
         if self._music_source is not None:
             self._music_source.volume = MUSIC_NORMAL_VOLUME
 
+    def swap_music_source(self, item_id: str, new_path: str, new_title: str | None = None):
+        """Switch a track from its live stream URL to a downloaded local
+        file once the background download finishes, seeking to the
+        current playback position so there's no restart/glitch.
+
+        If the track hasn't started playing yet (still queued), just
+        updates it in place instead. If it's already moved on (skipped,
+        finished) before the download completed, this is a no-op --
+        the caller is still responsible for cleaning up new_path in
+        that case.
+        """
+        with self._lock:
+            for queued_item in self.music_queue:
+                if queued_item.get("id") == item_id:
+                    queued_item["source"] = new_path
+                    queued_item["is_stream"] = False
+                    queued_item["cleanup"] = True
+                    if new_title:
+                        queued_item["title"] = new_title
+                    return True
+
+            if self._music_item is None or self._music_item.get("id") != item_id:
+                return False
+
+            elapsed = self._music_frames_played * (FRAME_BYTES / (48000 * 2 * 2))
+            try:
+                new_ffmpeg_source = discord.FFmpegPCMAudio(
+                    new_path, before_options=f"-ss {elapsed:.2f}"
+                )
+            except Exception as e:
+                print(f"Swap to downloaded file failed: {e}")
+                return False
+
+            old_source = self._music_source
+            volume = old_source.volume if old_source is not None else MUSIC_NORMAL_VOLUME
+            self._music_source = discord.PCMVolumeTransformer(new_ffmpeg_source, volume=volume)
+            if old_source is not None:
+                old_source.cleanup()
+
+            self._music_item["source"] = new_path
+            self._music_item["is_stream"] = False
+            self._music_item["cleanup"] = True
+            if new_title:
+                self._music_item["title"] = new_title
+            return True
+
     # -- discord.AudioSource interface ---------------------------------
 
     def read(self) -> bytes:
@@ -372,7 +533,10 @@ class GuildMixer(discord.AudioSource):
 
         music_bytes = b""
         if self._music_source is not None:
-            music_bytes = self._music_source.read()
+            with self._lock:
+                music_bytes = self._music_source.read()
+            if music_bytes:
+                self._music_frames_played += 1
             if not music_bytes:
                 self._finish_music()
                 self._advance_music()
@@ -416,10 +580,12 @@ class GuildMixer(discord.AudioSource):
         return False
 
     def cleanup(self):
-        self._finish_music()
+        self.active = False
+        if self.prefetch_task is not None:
+            self.prefetch_task.cancel()
         self._finish_speech()
-        self.music_queue.clear()
         self.speech_queue.clear()
+        self.clear_music()
 
 
 def _make_audio_file_gtts(text: str, path: str) -> None:
@@ -464,6 +630,142 @@ async def _make_audio_file_elevenlabs(text: str, path: str) -> None:
 
     with open(path, "wb") as f:
         f.write(data)
+
+
+# -- Chatbot (see !chat/!ask and @mentions) ------------------------------
+
+CHAT_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+# channel_id -> deque of {"role": "user"|"assistant", "content": str},
+# capped at CHAT_HISTORY_TURNS exchanges (2 entries per exchange), so each
+# channel keeps its own short-term chatbot context.
+chat_histories: dict[int, deque] = defaultdict(
+    lambda: deque(maxlen=CHAT_HISTORY_TURNS * 2)
+)
+
+# Preset ("canned") answers. If the user's message matches one of these,
+# the bot replies instantly with the saved text instead of calling the
+# chat API -- handy for FAQs and saves free-tier quota. Managed with
+# !preset add / !preset remove / !preset list. Keys are stored lowercase.
+PRESET_ANSWERS_FILE = os.path.join(DATA_DIR, "preset_answers.json")
+
+
+def load_preset_answers() -> dict[str, str]:
+    if not os.path.exists(PRESET_ANSWERS_FILE):
+        return {}
+    with open(PRESET_ANSWERS_FILE, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+
+def save_preset_answers():
+    with open(PRESET_ANSWERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(preset_answers, f, indent=4, ensure_ascii=False)
+
+
+preset_answers: dict[str, str] = load_preset_answers()
+
+
+def find_preset_answer(prompt: str) -> str | None:
+    """Return a saved canned answer if `prompt` matches a trigger, else None.
+    Tries an exact match first, then falls back to the trigger appearing
+    anywhere in the message (so short triggers like "hours" still fire)."""
+    prompt_lower = prompt.lower().strip()
+
+    if prompt_lower in preset_answers:
+        return preset_answers[prompt_lower]
+
+    for trigger, answer in preset_answers.items():
+        if trigger in prompt_lower:
+            return answer
+
+    return None
+
+
+async def _get_chat_reply(channel_id: int, prompt: str) -> str:
+    """Send `prompt` (plus this channel's recent history) to OpenAI's chat
+    completions API, return the reply text, and update the history."""
+    history = chat_histories[channel_id]
+    messages = [{"role": "system", "content": CHATBOT_SYSTEM_PROMPT}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": prompt})
+
+    headers = {
+        "Authorization": f"Bearer {CHATBOT_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": CHATBOT_MODEL,
+        "messages": messages,
+        "max_tokens": 300,
+    }
+
+    async with aiohttp.ClientSession(timeout=CHAT_TIMEOUT) as session:
+        async with session.post(
+            f"{CHATBOT_API_BASE}/chat/completions", headers=headers, json=payload
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(f"Chatbot API error {resp.status}: {body[:300]}")
+            data = await resp.json()
+
+    reply = data["choices"][0]["message"]["content"].strip()
+
+    history.append({"role": "user", "content": prompt})
+    history.append({"role": "assistant", "content": reply})
+
+    return reply
+
+
+async def respond_with_chat(
+    channel: discord.abc.Messageable,
+    guild: discord.Guild,
+    author: discord.abc.User,
+    prompt: str,
+):
+    """Get an AI reply for `prompt`, send it as text, and also speak it
+    aloud if the bot is currently connected to voice in this guild.
+    Checks preset/canned answers first, before touching the API."""
+    preset_reply = find_preset_answer(prompt)
+    if preset_reply is not None:
+        reply = preset_reply
+        await channel.send(reply)
+    else:
+        needs_key = "localhost" not in CHATBOT_API_BASE and "127.0.0.1" not in CHATBOT_API_BASE
+        if needs_key and not CHATBOT_API_KEY:
+            await channel.send(
+                "❌ Chatbot isn't configured. Set `CHATBOT_API_KEY` in your `.env`."
+            )
+            return
+
+        async with channel.typing():
+            try:
+                reply = await _get_chat_reply(channel.id, prompt)
+            except Exception as e:
+                await channel.send(f"❌ Chatbot request failed: {e}")
+                return
+
+        await channel.send(reply)
+
+    voice_client = guild.voice_client
+    if voice_client is not None:
+        try:
+            _ensure_mixer(guild)
+            is_owner = OWNER_USER_ID is not None and author.id == OWNER_USER_ID
+
+            spoken_prompt = format_speech_text(guild.id, author, prompt)
+            await queue_speech(guild, spoken_prompt, is_owner=is_owner)
+
+            spoken_reply = format_speech_text(guild.id, bot.user, reply)
+            await queue_speech(guild, spoken_reply, is_owner=is_owner)
+
+            _start_mixer_if_needed(guild)
+        except Exception as e:
+            print(f"[chat TTS] failed to speak reply: {e!r}")
+            await channel.send(f"⚠️ Got a reply, but couldn't speak it: {e}")
+
 
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
@@ -534,10 +836,92 @@ def _resolve_stream_source(url: str) -> dict:
         return {"url": url, "title": url, "webpage_url": url}
 
 
+# Where downloaded tracks are cached before playback (see
+# _download_youtube_audio). Separate from AUDIO_DIR (TTS clips) since
+# these files can be much larger.
+MUSIC_CACHE_DIR = "music_audio"
+os.makedirs(MUSIC_CACHE_DIR, exist_ok=True)
+
+
+def _download_youtube_audio(query: str) -> dict:
+    """Download a track's audio to a local file and return its path.
+
+    !play/!insert/!playlist queue tracks with this instead of streaming
+    the raw googlevideo URL live through ffmpeg. Streaming that URL
+    directly is prone to YouTube throttling or dropping the connection
+    mid-song ("Stream ends prematurely" / reconnect errors in the
+    ffmpeg log), which causes audible stutter/lag even once ffmpeg
+    reconnects. Downloading first means the actual voice playback reads
+    from a stable local file with no network involved. !stream is the
+    exception -- it's for live/unbounded streams, which can't be
+    downloaded, so it keeps playing the live URL directly.
+
+    Runs in a worker thread (it's blocking network + disk I/O).
+    """
+    options = dict(YTDL_OPTIONS)
+    options["noplaylist"] = True
+    options["outtmpl"] = os.path.join(
+        MUSIC_CACHE_DIR, f"{uuid.uuid4().hex}_%(id)s.%(ext)s"
+    )
+
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(query, download=True)
+        if "entries" in info:  # If a search term was used, grab the first hit
+            if not info["entries"]:
+                raise RuntimeError("No results found.")
+            info = info["entries"][0]
+        path = ydl.prepare_filename(info)
+        return {
+            "path": path,
+            "title": info.get("title", "Unknown title"),
+            "webpage_url": info.get("webpage_url", query),
+        }
+
+
 # Max number of tracks !playlist will queue from a single playlist. Set to
 # None to remove the cap (not recommended -- large playlists can take a
 # long time to extract and will flood the queue).
 MAX_PLAYLIST_TRACKS = int(os.getenv("MAX_PLAYLIST_TRACKS", "30"))
+
+# How many upcoming deferred (playlist) tracks to keep downloaded ahead of
+# time, so playback doesn't pause between songs waiting on a download.
+PREFETCH_AHEAD = int(os.getenv("PREFETCH_AHEAD", "5"))
+
+# Marks a queued track the prefetch task already tried and failed to
+# download, so _advance_music skips it instead of retrying forever.
+UNPLAYABLE = "__unplayable__"
+
+
+async def _prefetch_loop(mixer: "GuildMixer"):
+    """Background task: keep the next PREFETCH_AHEAD queued tracks that
+    don't have a local file yet (i.e. deferred playlist entries) downloaded
+    ahead of time. Runs for as long as the guild's mixer is active; started
+    in _ensure_mixer and cancelled in GuildMixer.cleanup().
+    """
+    while mixer.active:
+        try:
+            pending = [
+                item
+                for item in mixer.snapshot_queue()[:PREFETCH_AHEAD]
+                if item.get("source") is None
+            ]
+            for item in pending:
+                if not mixer.active:
+                    break
+                try:
+                    resolved = await asyncio.to_thread(
+                        _download_youtube_audio, item["webpage_url"]
+                    )
+                    item["source"] = resolved["path"]
+                    item["title"] = resolved.get("title", item["title"])
+                    item["cleanup"] = True
+                except Exception as e:
+                    print(f"Prefetch failed for '{item.get('title')}': {e}")
+                    item["source"] = UNPLAYABLE
+        except Exception as e:
+            print(f"Prefetch loop error: {e}")
+
+        await asyncio.sleep(2)
 
 
 def _extract_youtube_playlist(query: str) -> list[dict]:
@@ -654,6 +1038,7 @@ def _ensure_mixer(guild: discord.Guild) -> GuildMixer:
     if mixer is None:
         mixer = GuildMixer(guild)
         guild_mixers[guild.id] = mixer
+        mixer.prefetch_task = asyncio.create_task(_prefetch_loop(mixer))
     return mixer
 
 
@@ -719,21 +1104,62 @@ async def queue_speech(guild: discord.Guild, text: str, is_owner: bool = False):
 
 
 async def queue_music(ctx: commands.Context, query: str):
-    """Resolve a YouTube query/URL and add it to this guild's music lane."""
+    """Add a YouTube query/URL to this guild's music lane.
+
+    If nothing is currently playing, starts playback immediately from
+    a live stream URL (fast) and swaps to a downloaded local file in
+    the background once ready, for stutter-free playback going
+    forward. If something's already playing, just downloads normally
+    ahead of its turn -- there's no perceptible wait either way since
+    it won't play until the current track finishes.
+    """
     mixer = guild_mixers.get(ctx.guild.id)
     if mixer is None:
         await ctx.send("I'm not in a voice channel.")
         return
 
+    starts_immediately = mixer.is_idle
+
     status = await ctx.send(f"🔎 Looking up **{query}**...")
+
+    if starts_immediately:
+        try:
+            info = await asyncio.to_thread(_extract_youtube_audio, query)
+        except Exception as e:
+            await status.edit(content=f"❌ **Search failed for:** **{query}**\nReason: {e}")
+            return
+
+        item_id = uuid.uuid4().hex
+        mixer.queue_music({
+            "id": item_id,
+            "source": info["url"],
+            "title": info["title"],
+            "webpage_url": info["webpage_url"],
+            "is_stream": True,
+            "cleanup": False,
+        })
+
+        vol = get_guild_setting(ctx.guild.id, "volume", MUSIC_NORMAL_VOLUME)
+        current_volume = int(float(vol) * 100)
+        await status.edit(
+            content=(
+                f"🎵 Playing now: **{info['title']}**\n"
+                f"🔊 Volume: **{current_volume}%**\n"
+                f"⏳ Fetching a stable copy in the background..."
+            )
+        )
+        _start_mixer_if_needed(ctx.guild)
+
+        asyncio.create_task(_download_and_swap(mixer, item_id, info["webpage_url"]))
+        return
+
     try:
-        info = await asyncio.to_thread(_extract_youtube_audio, query)
+        info = await asyncio.to_thread(_download_youtube_audio, query)
     except Exception as e:
-        # Edit the status message to explicitly inform the user that it failed
         await status.edit(content=f"❌ **Search failed for:** **{query}**\nReason: {e}")
         return
 
-    mixer.queue_music({"source": info["url"], "title": info["title"]})
+    mixer.queue_music({"source": info["path"], "title": info["title"], "cleanup": True})
 
     vol = get_guild_setting(ctx.guild.id, "volume", MUSIC_NORMAL_VOLUME)
     current_volume = int(float(vol) * 100)
@@ -746,6 +1172,26 @@ async def queue_music(ctx: commands.Context, query: str):
         )
     )
     _start_mixer_if_needed(ctx.guild)
+
+
+async def _download_and_swap(mixer: "GuildMixer", item_id: str, webpage_url: str):
+    """Background task: download the actual audio file for a track that
+    started playing from a live stream URL, then hot-swap the mixer over
+    to it once ready. If the swap doesn't happen (track already moved on
+    before the download finished), clean up the downloaded file instead
+    of leaving it orphaned on disk."""
+    try:
+        resolved = await asyncio.to_thread(_download_youtube_audio, webpage_url)
+    except Exception as e:
+        print(f"Background download for swap failed: {e}")
+        return
+
+    swapped = mixer.swap_music_source(item_id, resolved["path"], resolved.get("title"))
+    if not swapped:
+        try:
+            os.remove(resolved["path"])
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +1251,86 @@ async def tts(ctx: commands.Context, *, text: str):
     await queue_speech(ctx.guild, full_text, is_owner=is_owner)
 
 
+@bot.command(aliases=["ask", "gpt"])
+async def chat(ctx: commands.Context, *, message: str):
+    """Ask the AI chatbot something. Replies in chat, and speaks the
+    answer aloud too -- joining your voice channel first if I'm not
+    already connected here.
+
+    You can also just @mention me instead of using this command."""
+    if ctx.voice_client is None and ctx.author.voice is not None and ctx.author.voice.channel is not None:
+        await ctx.author.voice.channel.connect()
+        bound_text_channel.setdefault(ctx.guild.id, ctx.channel.id)
+        _ensure_mixer(ctx.guild)
+
+    await respond_with_chat(ctx.channel, ctx.guild, ctx.author, message)
+
+
+@bot.command(aliases=["clearchat", "forget"])
+async def chatreset(ctx: commands.Context):
+    """Clear the chatbot's conversation memory for this channel."""
+    chat_histories.pop(ctx.channel.id, None)
+    await ctx.send("🧹 Chatbot memory cleared for this channel.")
+
+
+@bot.command(aliases=["presets", "canned"])
+async def preset(ctx: commands.Context, action: str = None, *, rest: str = None):
+    """
+    Manage preset (canned) chatbot answers.
+    Usage:
+      !preset add <trigger> | <answer>   -- save a canned answer
+      !preset remove <trigger>           -- delete one
+      !preset list                       -- show all triggers
+    A trigger fires if it appears anywhere in the user's message.
+    """
+    if action is None:
+        await ctx.send(
+            "Usage: `!preset add <trigger> | <answer>`, `!preset remove <trigger>`, "
+            "or `!preset list`."
+        )
+        return
+
+    action = action.lower()
+
+    if action == "list":
+        if not preset_answers:
+            await ctx.send("No preset answers saved yet.")
+            return
+        lines = [f"`{trigger}`" for trigger in preset_answers]
+        await ctx.send("**Preset triggers:**\n" + "\n".join(lines))
+        return
+
+    if action == "remove":
+        if not rest:
+            await ctx.send("Usage: `!preset remove <trigger>`")
+            return
+        trigger = rest.strip().lower()
+        if trigger in preset_answers:
+            del preset_answers[trigger]
+            save_preset_answers()
+            await ctx.send(f"🗑️ Removed preset for `{trigger}`.")
+        else:
+            await ctx.send(f"No preset found for `{trigger}`.")
+        return
+
+    if action == "add":
+        if not rest or "|" not in rest:
+            await ctx.send("Usage: `!preset add <trigger> | <answer>`")
+            return
+        trigger_part, answer_part = rest.split("|", 1)
+        trigger = trigger_part.strip().lower()
+        answer = answer_part.strip()
+        if not trigger or not answer:
+            await ctx.send("Usage: `!preset add <trigger> | <answer>`")
+            return
+        preset_answers[trigger] = answer
+        save_preset_answers()
+        await ctx.send(f"✅ Saved preset answer for `{trigger}`.")
+        return
+
+    await ctx.send("Unknown action. Use `add`, `remove`, or `list`.")
+
+
 @bot.command(aliases=["p"])
 async def play(ctx: commands.Context, *, query: str):
     """Search YouTube (or take a direct URL) and queue it for playback."""
@@ -848,7 +1374,7 @@ async def stream(ctx: commands.Context, *, url: str):
 
     # Only ever stream one thing at a time: drop anything queued/playing.
     mixer.clear_music()
-    mixer.queue_music({"source": info["url"], "title": info["title"]})
+    mixer.queue_music({"source": info["url"], "title": info["title"], "is_stream": True})
 
     await status.edit(content=f"📡 **Now streaming:** {info['title']}")
     _start_mixer_if_needed(ctx.guild)
@@ -895,10 +1421,11 @@ async def skipto(ctx: commands.Context, position: int):
         return
 
     # Discard every track before the target one.
-    for _ in range(position - 1):
-        mixer.music_queue.popleft()
+    target_title = mixer.discard_upcoming(position - 1)
+    if target_title is None:
+        await ctx.send("The queue changed before I could skip there — try again.")
+        return
 
-    target_title = mixer.music_queue[0]["title"]
     mixer.skip_music()  # ends the current track; the mixer auto-advances to the new front
     await ctx.send(f"⏭️ Skipping to **{target_title}**.")
 
@@ -913,12 +1440,12 @@ async def insert(ctx: commands.Context, *, query: str):
 
     status = await ctx.send(f"🔎 Looking up **{query}**...")
     try:
-        info = await asyncio.to_thread(_extract_youtube_audio, query)
+        info = await asyncio.to_thread(_download_youtube_audio, query)
     except Exception as e:
         await status.edit(content=f"❌ **Search failed for:** **{query}**\nReason: {e}")
         return
 
-    mixer.music_queue.appendleft({"source": info["url"], "title": info["title"]})
+    mixer.insert_next({"source": info["path"], "title": info["title"], "cleanup": True})
     await status.edit(content=f"⏩ **{info['title']}** will play next.")
     _start_mixer_if_needed(ctx.guild)
 
@@ -936,7 +1463,12 @@ async def stop(ctx: commands.Context):
 async def queue(ctx: commands.Context):
     """Display the current music queue."""
     mixer = guild_mixers.get(ctx.guild.id)
-    if mixer is None or (not mixer.now_playing_title and not mixer.music_queue):
+    if mixer is None:
+        await ctx.send("The queue is currently empty.")
+        return
+
+    upcoming = mixer.snapshot_queue()
+    if not mixer.now_playing_title and not upcoming:
         await ctx.send("The queue is currently empty.")
         return
 
@@ -944,13 +1476,13 @@ async def queue(ctx: commands.Context):
     if mixer.now_playing_title:
         msg += f"**Now Playing:** {mixer.now_playing_title}\n\n"
 
-    if mixer.music_queue:
+    if upcoming:
         msg += "**Up Next:**\n"
-        for idx, item in enumerate(list(mixer.music_queue)[:10], start=1):
+        for idx, item in enumerate(upcoming[:10], start=1):
             msg += f"`{idx}.` {item['title']}\n"
 
-        if len(mixer.music_queue) > 10:
-            msg += f"\n*...and {len(mixer.music_queue) - 10} more track(s)*"
+        if len(upcoming) > 10:
+            msg += f"\n*...and {len(upcoming) - 10} more track(s)*"
     else:
         msg += "*No remaining tracks in queue.*"
 
@@ -1132,6 +1664,21 @@ async def on_message(message: discord.Message):
         return
     if message.content.startswith(COMMAND_PREFIX):
         return  # don't read out commands themselves
+
+    # Chatbot: respond whenever the bot is directly @mentioned, in any
+    # channel (not just the one bound for auto-read TTS).
+    if bot.user in message.mentions:
+        query = message.content
+        for mention in message.mentions:
+            query = query.replace(f"<@{mention.id}>", "").replace(
+                f"<@!{mention.id}>", ""
+            )
+        query = query.strip()
+        if query:
+            await respond_with_chat(
+                message.channel, message.guild, message.author, query
+            )
+        return
 
     voice_client = message.guild.voice_client
 
