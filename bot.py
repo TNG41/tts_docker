@@ -298,6 +298,16 @@ class GuildMixer(discord.AudioSource):
     def resume(self):
         self._paused = False
 
+    def set_volume(self, level: float):
+        """Apply a new normal-playback volume to whatever's currently
+        playing. Only takes effect immediately if music isn't currently
+        ducked for TTS -- the ducked level always wins while a clip is
+        speaking, and the new normal level is picked up next time
+        _advance_music or _restore_volume runs (both read the saved
+        per-guild setting rather than a value passed in)."""
+        if self._music_source is not None and self._speech_source is None:
+            self._music_source.volume = level
+
     @staticmethod
     def _discard_music_item(item: dict):
         """Delete a queued (not-yet-played) track's downloaded file, if any."""
@@ -1093,6 +1103,25 @@ async def on_ready():
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
 
 
+async def _ensure_voice(ctx: commands.Context) -> bool:
+    """Make sure the bot is connected to voice in this guild -- joining
+    the caller's current channel if it isn't already -- and that this
+    text channel is bound for TTS/now-playing messages. Sends an error
+    and returns False if the caller isn't in a voice channel to join.
+
+    Shared by !play, !stream, !playlist, and !said.
+    """
+    if ctx.voice_client is None:
+        if ctx.author.voice is None or ctx.author.voice.channel is None:
+            await ctx.send("You need to be in a voice channel first.", silent=True)
+            return False
+        await ctx.author.voice.channel.connect(self_deaf=True)
+
+    bound_text_channel.setdefault(ctx.guild.id, ctx.channel.id)
+    _ensure_mixer(ctx.guild)
+    return True
+
+
 @bot.command()
 async def join(ctx: commands.Context):
     """Join the caller's current voice channel and bind this text channel."""
@@ -1224,16 +1253,8 @@ async def preset(ctx: commands.Context, action: str = None, *, rest: str = None)
 @bot.command(aliases=["p"])
 async def play(ctx: commands.Context, *, query: str):
     """Search YouTube (or take a direct URL) and queue it for playback."""
-    if ctx.author.voice is None or ctx.author.voice.channel is None:
-        await ctx.send("You need to be in a voice channel first.", silent=True)
+    if not await _ensure_voice(ctx):
         return
-
-    if ctx.voice_client is None:
-        await ctx.author.voice.channel.connect(self_deaf=True)
-        # Bind this text channel too, so TTS also works without a separate !join.
-        bound_text_channel.setdefault(ctx.guild.id, ctx.channel.id)
-
-    _ensure_mixer(ctx.guild)
     await queue_music(ctx, query)
 
 
@@ -1245,14 +1266,8 @@ async def stream(ctx: commands.Context, *, url: str):
     running !stream again drops whatever was playing/queued instead of
     adding to it. Good for internet radio or live streams with no fixed end.
     """
-    if ctx.author.voice is None or ctx.author.voice.channel is None:
-        await ctx.send("You need to be in a voice channel first.", silent=True)
+    if not await _ensure_voice(ctx):
         return
-
-    if ctx.voice_client is None:
-        await ctx.author.voice.channel.connect(self_deaf=True)
-        bound_text_channel.setdefault(ctx.guild.id, ctx.channel.id)
-
     mixer = _ensure_mixer(ctx.guild)
 
     status = await ctx.send(f"🔎 Resolving stream **{url}**...", silent=True)
@@ -1273,15 +1288,8 @@ async def stream(ctx: commands.Context, *, url: str):
 @bot.command(aliases=["pl"])
 async def playlist(ctx: commands.Context, *, query: str):
     """Queue an entire YouTube playlist."""
-    if ctx.author.voice is None or ctx.author.voice.channel is None:
-        await ctx.send("You need to be in a voice channel first.", silent=True)
+    if not await _ensure_voice(ctx):
         return
-
-    if ctx.voice_client is None:
-        await ctx.author.voice.channel.connect(self_deaf=True)
-        bound_text_channel.setdefault(ctx.guild.id, ctx.channel.id)
-
-    _ensure_mixer(ctx.guild)
     await queue_playlist(ctx, query)
 
 
@@ -1427,8 +1435,8 @@ async def volume(ctx: commands.Context, level: int):
     set_guild_setting(ctx.guild.id, "volume", vol)
 
     mixer = guild_mixers.get(ctx.guild.id)
-    if mixer and mixer._music_source:
-        mixer._music_source.volume = vol
+    if mixer:
+        mixer.set_volume(vol)
 
     await ctx.send(f"🔊 Volume set to **{level}%**", silent=True)
 
@@ -1505,15 +1513,8 @@ async def said(ctx: commands.Context, *, text: str):
         await ctx.send("`!xsaid` is currently turned off on this server. Enable it with `!xsaidtoggle on`.")
         return
 
-    if ctx.voice_client is None:
-        if ctx.author.voice is None or ctx.author.voice.channel is None:
-            await ctx.send("You need to be in a voice channel first.")
-            return
-
-        await ctx.author.voice.channel.connect(self_deaf=True)
-        bound_text_channel.setdefault(ctx.guild.id, ctx.channel.id)
-
-    _ensure_mixer(ctx.guild)
+    if not await _ensure_voice(ctx):
+        return
 
     full_text = format_speech_text(ctx.guild.id, ctx.author, text)
     is_owner = OWNER_USER_ID is not None and ctx.author.id == OWNER_USER_ID
